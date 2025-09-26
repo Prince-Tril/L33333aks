@@ -1,0 +1,564 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local character = player.Character or player.CharacterAdded:Wait()
+local hrp = character:WaitForChild("HumanoidRootPart")
+
+-- Ð¡Ð¾ÑÑ‚Ð¾ÑÐ½Ð¸Ðµ ÑÐºÑ€Ð¸Ð¿Ñ‚Ð°
+local isActive = false
+local isMoving = false
+local promptTriggered = false
+local armCheckConnection = nil
+local promptConnection = nil
+local currentProcess = nil
+
+-- Ð¡Ð¸ÑÑ‚ÐµÐ¼Ð° Ð²Ð¾ÑÑÑ‚Ð°Ð½Ð¾Ð²Ð»ÐµÐ½Ð¸Ñ Ð¿ÑƒÑ‚Ð¸
+local lastPosition = Vector3.new(0, 0, 0)
+local lastValidPosition = Vector3.new(0, 0, 0)
+local currentStage = "none" -- "moving_to_target", "moving_to_delivery", "at_target"
+local currentTarget = nil
+local currentLevel = 1
+local isFromThirdFloor = false
+local recoveryConnection = nil
+local positionHistory = {}
+local maxHistorySize = 30
+
+-- === GUI SETUP ===
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "MovementControlGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = playerGui
+
+local backgroundFrame = Instance.new("Frame")
+backgroundFrame.Size = UDim2.new(0, 220, 0, 80)
+backgroundFrame.Position = UDim2.new(1, -230, 0, 10)
+backgroundFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+backgroundFrame.BorderSizePixel = 0
+backgroundFrame.Parent = screenGui
+
+local uiCornerBg = Instance.new("UICorner")
+uiCornerBg.CornerRadius = UDim.new(0, 10)
+uiCornerBg.Parent = backgroundFrame
+
+local buttonFrame = Instance.new("Frame")
+buttonFrame.Size = UDim2.new(0, 200, 0, 40)
+buttonFrame.Position = UDim2.new(0, 10, 0, 10)
+buttonFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+buttonFrame.BorderSizePixel = 0
+buttonFrame.Parent = backgroundFrame
+
+local uiCorner = Instance.new("UICorner")
+uiCorner.CornerRadius = UDim.new(0, 10)
+uiCorner.Parent = buttonFrame
+
+local uiGradient = Instance.new("UIGradient")
+uiGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(100, 200, 255)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(50, 150, 255))
+})
+uiGradient.Rotation = 45
+uiGradient.Parent = buttonFrame
+
+local uiShadow = Instance.new("UIStroke")
+uiShadow.Thickness = 2
+uiShadow.Color = Color3.fromRGB(50, 50, 50)
+uiShadow.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+uiShadow.Parent = buttonFrame
+
+local textButton = Instance.new("TextButton")
+textButton.Size = UDim2.new(1, -10, 1, -10)
+textButton.Position = UDim2.new(0, 5, 0, 5)
+textButton.BackgroundTransparency = 1
+textButton.Text = "Start Process"
+textButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+textButton.TextSize = 18
+textButton.Font = Enum.Font.GothamBold
+textButton.Parent = buttonFrame
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(0, 200, 0, 30)
+statusLabel.Position = UDim2.new(0, 10, 0, 50)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "Press the button before Stealing!"
+statusLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+statusLabel.TextSize = 14
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextWrapped = true
+statusLabel.Parent = backgroundFrame
+
+-- === DRAGGABLE FUNCTIONALITY ===
+local dragging = false
+local dragStart = nil
+local startPos = nil
+
+backgroundFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = backgroundFrame.Position
+    end
+end)
+
+backgroundFrame.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        backgroundFrame.Position = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+-- === FUNCTION TO UPDATE STATUS LABEL ===
+local function updateStatus(text)
+    statusLabel.Text = text
+    print(text)
+end
+
+-- === Ð¡Ð˜Ð¡Ð¢Ð•ÐœÐ ÐžÐ¢Ð¡Ð›Ð•Ð–Ð˜Ð’ÐÐÐ˜Ð¯ ÐŸÐžÐ—Ð˜Ð¦Ð˜Ð™ ===
+local function addToHistory(position)
+    table.insert(positionHistory, 1, {pos = position, time = tick()})
+    if #positionHistory > maxHistorySize then
+        table.remove(positionHistory, maxHistorySize + 1)
+    end
+end
+
+local function isPositionValid(currentPos, expectedDirection)
+    if #positionHistory < 3 then return true end
+    
+    local lastPos = positionHistory[2].pos
+    local movement = currentPos - lastPos
+    
+    -- ÐŸÑ€Ð¾Ð²ÐµÑ€ÑÐµÐ¼ Ð½Ð° Ñ‚ÐµÐ»ÐµÐ¿Ð¾Ñ€Ñ‚Ð°Ñ†Ð¸ÑŽ (Ñ€ÐµÐ·ÐºÐ¾Ðµ Ð¸Ð·Ð¼ÐµÐ½ÐµÐ½Ð¸Ðµ Ð¿Ð¾Ð·Ð¸Ñ†Ð¸Ð¸)
+    if movement.Magnitude > 50 then
+        updateStatus("Detected teleportation: " .. movement.Magnitude)
+        return false
+    end
+    
+    -- ÐŸÑ€Ð¾Ð²ÐµÑ€ÑÐµÐ¼ Ð½Ð°Ð¿Ñ€Ð°Ð²Ð»ÐµÐ½Ð¸Ðµ Ð´Ð²Ð¸Ð¶ÐµÐ½Ð¸Ñ
+    if expectedDirection and expectedDirection.Magnitude > 0 then
+        local dot = movement.Unit:Dot(expectedDirection.Unit)
+        if dot < -0.5 then -- Ð”Ð²Ð¸Ð¶ÐµÐ¼ÑÑ Ð² Ð¿Ñ€Ð¾Ñ‚Ð¸Ð²Ð¾Ð¿Ð¾Ð»Ð¾Ð¶Ð½Ð¾Ð¼ Ð½Ð°Ð¿Ñ€Ð°Ð²Ð»ÐµÐ½Ð¸Ð¸
+            updateStatus("Detected wrong direction movement")
+            return false
+        end
+    end
+    
+    return true
+end
+
+local function startRecoverySystem()
+    if recoveryConnection then
+        recoveryConnection:Disconnect()
+    end
+    
+    recoveryConnection = RunService.Heartbeat:Connect(function()
+        if not isMoving then
+            if recoveryConnection then
+                recoveryConnection:Disconnect()
+                recoveryConnection = nil
+            end
+            return
+        end
+        
+        local currentPos = hrp.Position
+        addToHistory(currentPos)
+        
+        -- ÐžÐ¿Ñ€ÐµÐ´ÐµÐ»ÑÐµÐ¼ Ð¾Ð¶Ð¸Ð´Ð°ÐµÐ¼Ð¾Ðµ Ð½Ð°Ð¿Ñ€Ð°Ð²Ð»ÐµÐ½Ð¸Ðµ Ð² Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑ‚Ð¸ Ð¾Ñ‚ ÑÑ‚Ð°Ð´Ð¸Ð¸
+        local expectedDirection = nil
+        if currentStage == "moving_to_target" and currentTarget then
+            local targetPos = getTargetPosition(currentTarget)
+            if targetPos then
+                expectedDirection = (targetPos - currentPos)
+            end
+        elseif currentStage == "moving_to_delivery" then
+            local delivery = FindDelivery()
+            if delivery then
+                expectedDirection = (delivery.Position - currentPos)
+            end
+        end
+        
+        -- ÐŸÑ€Ð¾Ð²ÐµÑ€ÑÐµÐ¼ Ð²Ð°Ð»Ð¸Ð´Ð½Ð¾ÑÑ‚ÑŒ Ð¿Ð¾Ð·Ð¸Ñ†Ð¸Ð¸
+        if not isPositionValid(currentPos, expectedDirection) then
+            updateStatus("Position anomaly detected! Initiating recovery...")
+            
+            -- ÐžÑÑ‚Ð°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°ÐµÐ¼ Ñ‚ÐµÐºÑƒÑ‰ÐµÐµ Ð´Ð²Ð¸Ð¶ÐµÐ½Ð¸Ðµ
+            for _, obj in ipairs(hrp:GetChildren()) do
+                if obj:IsA("LinearVelocity") or obj.Name == "FlightVelocity" then
+                    obj:Destroy()
+                end
+            end
+            
+            -- Ð–Ð´ÐµÐ¼ ÑÐµÐºÑƒÐ½Ð´Ñƒ Ð´Ð»Ñ ÑÑ‚Ð°Ð±Ð¸Ð»Ð¸Ð·Ð°Ñ†Ð¸Ð¸
+            task.wait(1)
+            
+            if not isMoving then return end
+            
+            updateStatus("Recovering movement from stage: " .. currentStage)
+            
+            -- ÐŸÑ€Ð¾Ð´Ð¾Ð»Ð¶Ð°ÐµÐ¼ Ñ Ñ‚Ð¾Ð³Ð¾ Ð¶Ðµ ÑÑ‚Ð°Ð¿Ð°
+            if currentStage == "moving_to_target" and currentTarget then
+                updateStatus("Resuming movement to target")
+                moveToTarget(currentTarget, currentLevel, isFromThirdFloor)
+            elseif currentStage == "moving_to_delivery" then
+                updateStatus("Resuming movement to delivery")
+                moveToDelivery()
+            end
+        end
+        
+        lastPosition = currentPos
+        if currentPos.Y > -1000 then -- Ð’Ð°Ð»Ð¸Ð´Ð½Ð°Ñ Ð¿Ð¾Ð·Ð¸Ñ†Ð¸Ñ
+            lastValidPosition = currentPos
+        end
+    end)
+end
+
+-- === RESET STATUS ON CHARACTER RESPAWN ===
+player.CharacterAdded:Connect(function(newCharacter)
+    character = newCharacter
+    hrp = newCharacter:WaitForChild("HumanoidRootPart")
+    updateStatus("Idle")
+    currentStage = "none"
+    positionHistory = {}
+    print("Character respawned, status reset to Idle")
+end)
+
+-- === MOVEMENT SCRIPT ===
+local function FindDelivery()
+    local plots = workspace:FindFirstChild("Plots")
+    if not plots then
+        warn("Plots folder not found in workspace")
+        return
+    end
+    for _, plot in pairs(plots:GetChildren()) do
+        local sign = plot:FindFirstChild("PlotSign")
+        if sign then
+            local yourBase = sign:FindFirstChild("YourBase")
+            if yourBase and yourBase.Enabled then
+                local hitbox = plot:FindFirstChild("DeliveryHitbox")
+                if hitbox then return hitbox end
+            end
+        end
+    end
+    warn("No valid DeliveryHitbox found")
+end
+
+local function setupFlight()
+    if hrp:FindFirstChild("FlightAttachment") then
+        hrp.FlightAttachment:Destroy()
+    end
+    if hrp:FindFirstChildOfClass("LinearVelocity") then
+        hrp:FindFirstChildOfClass("LinearVelocity"):Destroy()
+    end
+
+    local attachment = Instance.new("Attachment")
+    attachment.Name = "FlightAttachment"
+    attachment.Parent = hrp
+
+    local lv = Instance.new("LinearVelocity")
+    lv.Attachment0 = attachment
+    lv.RelativeTo = Enum.ActuatorRelativeTo.World
+    lv.MaxForce = math.huge
+    lv.Name = "FlightVelocity"
+    lv.Parent = hrp
+    return lv, attachment
+end
+
+local function moveToDelivery()
+    currentStage = "moving_to_delivery"
+    local targetHitbox = FindDelivery()
+    if not targetHitbox then
+        warn("No target to move towards")
+        updateStatus("No delivery target found")
+        return
+    end
+
+    for _, obj in ipairs(hrp:GetChildren()) do
+        if obj:IsA("LinearVelocity") or obj:IsA("Attachment") then
+            obj:Destroy()
+        end
+    end
+
+    local lv, attachment = setupFlight()
+    local currentY = hrp.Position.Y
+    updateStatus("Flying to delivery...")
+
+    local speed = 135 -- Ð˜Ð·Ð¼ÐµÐ½ÐµÐ½Ð° ÑÐºÐ¾Ñ€Ð¾ÑÑ‚ÑŒ Ð½Ð° 130
+    
+    local reached = false
+    local maxTime = 8
+    local startTime = tick()
+
+    local connection
+    connection = RunService.Heartbeat:Connect(function()
+        if not isMoving then
+            lv.VectorVelocity = Vector3.zero
+            lv:Destroy()
+            connection:Disconnect()
+            return
+        end
+
+        if not targetHitbox or not targetHitbox:IsDescendantOf(workspace) then
+            warn("Target lost during flight")
+            updateStatus("Delivery target lost")
+            lv.VectorVelocity = Vector3.zero
+            lv:Destroy()
+            connection:Disconnect()
+            reached = true
+            return
+        end
+
+        local targetPos = targetHitbox.Position - Vector3.new(0, 6, 0)
+        local direction = (targetPos - hrp.Position)
+        local distance = direction.Magnitude
+
+        if distance <= 0.5 then
+            updateStatus("Reached delivery target, distance: " .. distance)
+            lv.VectorVelocity = Vector3.zero
+            lv:Destroy()
+            connection:Disconnect()
+            reached = true
+            local humanoid = character:FindFirstChild("Humanoid")
+            if humanoid then
+                humanoid.PlatformStand = false
+                updateStatus("PlatformStand disabled")
+            end
+            return
+        end
+
+        if tick() - startTime >= maxTime then
+            warn("Timeout before reaching delivery target")
+            updateStatus("Timeout during delivery")
+            lv.VectorVelocity = Vector3.zero
+            lv:Destroy()
+            connection:Disconnect()
+            reached = true
+            return
+        end
+
+        local unitDir = direction.Unit
+        lv.VectorVelocity = Vector3.new(unitDir.X * speed, unitDir.Y * speed, unitDir.Z * speed)
+        updateStatus("Moving to delivery, distance: " .. distance)
+    end)
+
+    while not reached do
+        task.wait()
+    end
+
+    if not isMoving then return end
+
+    updateStatus("Starting smooth deceleration for delivery")
+    lv, attachment = setupFlight()
+    for i = 1, 12 do
+        if not isMoving then break end
+        speed = speed * 0.6
+        local dir = (targetHitbox.Position - Vector3.new(0, 6, 0) - hrp.Position)
+        if dir.Magnitude > 0 then
+            dir = dir.Unit
+            lv.VectorVelocity = Vector3.new(dir.X * speed, dir.Y * speed, dir.Z * speed)
+            updateStatus("Decelerating for delivery, iteration: " .. i)
+        else
+            lv.VectorVelocity = Vector3.zero
+        end
+        task.wait()
+    end
+    lv:Destroy()
+
+    if not isMoving then return end
+
+    updateStatus("Starting smooth descent for delivery")
+    lv, attachment = setupFlight()
+    local targetY = targetHitbox.Position.Y - 6 + 2.5
+    local reachedY = false
+    connection = RunService.Heartbeat:Connect(function()
+        if not isMoving then
+            lv.VectorVelocity = Vector3.zero
+            lv:Destroy()
+            connection:Disconnect()
+            reachedY = true
+            return
+        end
+
+        if hrp.Position.Y <= targetY then
+            lv.VectorVelocity = Vector3.zero
+            lv:Destroy()
+            connection:Disconnect()
+            reachedY = true
+            local humanoid = character:FindFirstChild("Humanoid")
+            if humanoid then
+                humanoid.PlatformStand = false
+                updateStatus("PlatformStand disabled")
+            end
+            return
+        end
+        lv.VectorVelocity = Vector3.new(0, -speed, 0)
+        updateStatus("Descending for delivery, current Y: " .. hrp.Position.Y)
+    end)
+
+    while not reachedY do
+        task.wait()
+    end
+
+    updateStatus("Cleaning up delivery objects")
+    if attachment then attachment:Destroy() end
+    if isMoving then
+        updateStatus("Idle")
+        isMoving = false
+        textButton.Text = "Start Process"
+        currentStage = "none"
+    end
+end
+
+local function getLaserCenter(model)
+    if not model:IsA("Model") then return nil end
+    local primary = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+    if not primary then return nil end
+    return primary.Position
+end
+
+local function isSizeClose(partSize, targetSize, tolerance)
+    return math.abs(partSize.X - targetSize.X) <= tolerance
+        and math.abs(partSize.Y - targetSize.Y) <= tolerance
+        and math.abs(partSize.Z - targetSize.Z) <= tolerance
+end
+
+local function getTargetForFloor(level, fromThirdFloor)
+    local closestTarget, closestDistance = nil, math.huge
+
+    for _, plot in ipairs(workspace:WaitForChild("Plots"):GetChildren()) do
+        if level == 1 then
+            local laserFolder = plot:FindFirstChild("Laser")
+            if laserFolder then
+                for _, laser in ipairs(laserFolder:GetChildren()) do
+                    if laser:IsA("Model") then
+                        local pos = getLaserCenter(laser)
+                        if pos and pos.Y <= 8 then
+                            local dist = (pos - hrp.Position).Magnitude
+                            if dist < closestDistance then
+                                closestDistance = dist
+                                closestTarget = laser
+                            end
+                        end
+                    end
+                end
+            end
+        elseif level == 2 then
+            if not fromThirdFloor then
+                local modelFolder = plot:FindFirstChild("Model")
+                local foundInitialTarget = false
+                if modelFolder then
+                    for _, obj in ipairs(modelFolder:GetChildren()) do
+                        if obj:IsA("BasePart") and isSizeClose(obj.Size, Vector3.new(5, 1, 1), 0.01) then
+                            local dist = (obj.Position - hrp.Position).Magnitude
+                            if dist < 5 then
+                                if dist < closestDistance then
+                                    closestDistance = dist
+                                    closestTarget = obj
+                                    foundInitialTarget = true
+                                end
+                            end
+                        end
+                    end
+                end
+                if not foundInitialTarget then
+                    local decorations = plot:FindFirstChild("Decorations")
+                    if decorations then
+                        for _, obj in ipairs(decorations:GetChildren()) do
+                            if obj:IsA("BasePart") and isSizeClose(obj.Size, Vector3.new(45, 45, 2), 0.01) then
+                                local posY = obj.Position.Y
+                                if posY >= 8 and posY <= 9.1 then
+                                    local dist = (obj.Position - hrp.Position).Magnitude
+                                    if dist < closestDistance then
+                                        closestDistance = dist
+                                        closestTarget = obj
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            else
+                local decorations = plot:FindFirstChild("Decorations")
+                if decorations then
+                    for _, obj in ipairs(decorations:GetChildren()) do
+                        if obj:IsA("BasePart") and isSizeClose(obj.Size, Vector3.new(17, 10, 2), 0.01) then
+                            local dist = (obj.Position - hrp.Position).Magnitude
+                            if dist < closestDistance then
+                                closestDistance = dist
+                                closestTarget = obj
+                            end
+                        end
+                    end
+                end
+            end
+        elseif level == 3 then
+            local laserHitboxFolder = plot:FindFirstChild("LaserHitbox")
+            if laserHitboxFolder then
+                local thirdFloorPart = laserHitboxFolder:FindFirstChild("ThirdFloor")
+                if thirdFloorPart then
+                    local dist = (thirdFloorPart.Position - hrp.Position).Magnitude
+                    if dist < closestDistance then
+                        closestDistance = dist
+                        closestTarget = thirdFloorPart
+                    end
+                end
+            end
+        end
+    end
+    
+    return closestTarget
+end
+
+local function getTargetPosition(target)
+    if target:IsA("Model") then
+        return getLaserCenter(target)
+    elseif target:IsA("BasePart") then
+        local pos = target.Position
+        if isSizeClose(target.Size, Vector3.new(17, 10, 2), 0.01) then
+            local zOffset = hrp.Position.X > -410 and 5 or -5
+            pos = pos + Vector3.new(0, 0, zOffset)
+        end
+        return pos
+    else
+        return nil
+    end
+end
+
+local function moveUntil(conditionFunc, directionFunc, callback)
+    local speed = 95 -- Ð˜Ð·Ð¼ÐµÐ½ÐµÐ½Ð° ÑÐºÐ¾Ñ€Ð¾ÑÑ‚ÑŒ Ð½Ð° 95
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if not isMoving then
+            hrp.Velocity = Vector3.zero
+            conn:Disconnect()
+            return
+        end
+
+        if conditionFunc() then
+            hrp.Velocity = Vector3.zero
+            conn:Disconnect()
+            if callback then callback() end
+        else
+            local dir = directionFunc()
+            if dir.Magnitude > 0 then
+                dir = dir.Unit
+                hrp.Velocity = Vector3.new(dir.X * speed, hrp.Velocity.Y, dir.Z * speed)
+            else
+                hrp.Velocity = Vector3.zero
+            end
+        end
+    
